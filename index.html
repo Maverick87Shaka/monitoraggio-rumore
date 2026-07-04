@@ -56,9 +56,19 @@
                     }
                 } catch (e) {
                     document.getElementById("status").innerText = "Errore registrazione server.";
+                    document.getElementById("status").style.color = "#dc3545"; // Rosso errore
+                    return;
                 }
             }
-            document.getElementById("userId").innerText = stationId || "Errore";
+            
+            // AGGIORNAMENTO: Se l'ID esiste o è appena stato creato, aggiorna lo stato visivo
+            if (stationId) {
+                document.getElementById("userId").innerText = stationId;
+                document.getElementById("status").innerText = "Dispositivo Pronto! Premi 'Avvia Monitoraggio'";
+                document.getElementById("status").style.color = "#28a745"; // Verde successo
+            } else {
+                document.getElementById("userId").innerText = "Errore";
+            }
         }
         checkRegistration();
 
