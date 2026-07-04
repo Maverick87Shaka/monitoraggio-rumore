@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rilevatore Rumore Mobile</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; background: #111; color: #fff; padding: 20px; }
+        .btn { background: #007bff; border: none; color: white; padding: 10px 30px; font-size: 18px; border-radius: 5px; cursor: pointer; margin: 10px; }
+        .btn:disabled { background: #444; color: #888; }
+        .data-box { background: #222; border: 1px solid #444; padding: 10px; border-radius: 5px; margin: 20px auto; max-width: 400px; }
+        .status { color: #ffc107; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <h2>Monitoraggio Rumore</h2>
+    <p>Questa pagina invia dati acustici e GPS anonimi ogni 10 secondi.</p>
+
+    <button id="startBtn" class="btn">Avvia Monitoraggio</button>
+    <button id="stopBtn" class="btn" disabled>Ferma</button>
+
+    <div class="data-box">
+        <p><strong>Stazione ID Anonima:</strong> <span id="userId">Inizializzazione...</span></p>
+        <p><strong>Lettura Istantanea:</strong> <span id="currentDb">--</span> dBA</p>
+        <p><strong>Picco nei 10s:</strong> <span id="maxDb">--</span> dBA</p>
+        <p><strong>Latitudine:</strong> <span id="lat">--</span></p>
+        <p><strong>Longitudine:</strong> <span id="lon">--</span></p>
+    </div>
+
+    <p>Stato Invio: <span id="status" class="status">Spento</span></p>
+
+    <script>
+        const API_REGISTER = "https://telemetria.rampc.it/api/register";
+        const API_TELEMETRY = "https://telemetria.rampc.it/api/telemetry/mobile";
+
+        let stationId = localStorage.getItem("web_station_id");
+        let audioContext, analyser, javascriptNode, micStream;
+        let gpsInterval, sendInterval;
+        let maxDbaPool = 0;
+        let lat = null, lon = null;
+        
+        // Oggetto per gestire il blocco dello standby
+        let wakeLock = null; 
+
+        // 1. Registrazione anonima automatica tramite il backend Node.js
+        async function checkRegistration() {
+            if (!stationId) {
+                try {
+                    document.getElementById("status").innerText = "Registrazione dispositivo...";
+                    const res = await fetch(API_REGISTER, { method: "POST" });
+                    const data = await res.json();
+                    if (data.success) {
+                        stationId = data.station_id;
+                        localStorage.setItem("web_station_id", stationId);
+                    }
+                } catch (e) {
+                    document.getElementById("status").innerText = "Errore registrazione server.";
+                }
+            }
+            document.getElementById("userId").innerText = stationId || "Errore";
+        }
+        checkRegistration();
+
+        // 🆕 FUNZIONE: Richiede il blocco dello standby (Keep Screen Awake)
+        async function requestWakeLock() {
+            try {
+                if ('wakeLock' in navigator) {
+                    wakeLock = await navigator.wakeLock.request('screen');
+                    console.log("Wake Lock attivato: lo schermo rimarrà acceso!");
+                } else {
+                    console.log("Wake Lock non supportato da questo browser.");
+                }
+            } catch (err) {
+                console.error(`Errore attivazione Wake Lock: ${err.message}`);
+            }
+        }
+
+        // 🆕 FUNZIONE: Rilascia il blocco dello standby
+        function releaseWakeLock() {
+            if (wakeLock !== null) {
+                wakeLock.release().then(() => {
+                    wakeLock = null;
+                    console.log("Wake Lock rilasciato: lo standby è di nuovo attivo.");
+                });
+            }
+        }
+
+        // 🆕 GESTORE RE-ENGAGEMENT: Se l'utente riduce il browser a icona e poi lo riapre, riattiva il blocco
+        document.addEventListener('visibilitychange', async () => {
+            if (wakeLock !== null && document.visibilityState === 'visible') {
+                await requestWakeLock();
+            }
+        });
+
+        // 2. Acquisizione del GPS continuo dello smartphone
+        function startGPS() {
+            if (navigator.geolocation) {
+                gpsInterval = navigator.geolocation.watchPosition((position) => {
+                    lat = position.coords.latitude;
+                    lon = position.coords.longitude;
+                    document.getElementById("lat").innerText = lat.toFixed(5);
+                    document.getElementById("lon").innerText = lon.toFixed(5);
+                }, (err) => console.log("Errore GPS:", err), { enableHighAccuracy: true });
+            }
+        }
+
+        // 3. Elaborazione Audio e Calcolo dBA (HTML5 Web Audio API)
+        async function startAudio() {
+            micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            analyser = audioContext.createAnalyser();
+            const source = audioContext.createMediaStreamSource(micStream);
+            
+            analyser.fftSize = 256;
+            javascriptNode = audioContext.createScriptProcessor(2048, 1, 1);
+            source.connect(analyser);
+            analyser.connect(javascriptNode);
+            javascriptNode.connect(audioContext.destination);
+
+            javascriptNode.onaudioprocess = function() {
+                const array = new Uint8Array(analyser.frequencyBinCount);
+                analyser.getByteFrequencyData(array);
+                
+                let values = 0;
+                for (let i = 0; i < array.length; i++) { values += array[i]; }
+                let average = values / array.length;
+
+                let currentDba = average > 0 ? (20 * Math.log10(average)) + 35 : 30;
+                currentDba = Math.min(Math.max(currentDba, 30), 110); 
+
+                document.getElementById("currentDb").innerText = currentDba.toFixed(1);
+                if (currentDba > maxDbaPool) { maxDbaPool = currentDba; }
+                document.getElementById("maxDb").innerText = maxDbaPool.toFixed(1);
+            };
+        }
+
+        // 4. Logica di avvio e cicli di trasmissione POST
+        document.getElementById("startBtn").onclick = async () => {
+            try {
+                await startAudio();
+                startGPS();
+                
+                // 🆕 Attiva il blocco dello standby dello schermo
+                await requestWakeLock(); 
+
+                document.getElementById("startBtn").disabled = true;
+                document.getElementById("stopBtn").disabled = false;
+                document.getElementById("status").innerText = "In ascolto, invio tra 10s... (Schermo Bloccato Acceso)";
+
+                sendInterval = setInterval(async () => {
+                    if (lat === null || lon === null) return; 
+
+                    const payload = {
+                        station_id: stationId,
+                        dba: parseFloat(maxDbaPool.toFixed(1)),
+                        latitude: lat,
+                        longitude: lon
+                    };
+                    maxDbaPool = 0; 
+
+                    try {
+                        const res = await fetch(API_TELEMETRY, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify(payload)
+                        });
+                        document.getElementById("status").innerText = `Inviato con successo (${res.status})`;
+                    } catch (err) {
+                        document.getElementById("status").innerText = "Errore di rete nell'invio";
+                    }
+                }, 10000);
+
+            } catch (e) {
+                alert("Permessi microfono negati o errore audio.");
+            }
+        };
+
+        document.getElementById("stopBtn").onclick = () => {
+            clearInterval(sendInterval);
+            navigator.geolocation.clearWatch(gpsInterval);
+            if (micStream) micStream.getTracks().forEach(track => track.stop());
+            if (audioContext) audioContext.close();
+            
+            // 🆕 Rilascia lo schermo, permettendo al telefono di tornare in standby normalmente
+            releaseWakeLock(); 
+
+            document.getElementById("startBtn").disabled = false;
+            document.getElementById("stopBtn").disabled = true;
+            document.getElementById("status").innerText = "Spento";
+        };
+    </script>
+</body>
+</html>
